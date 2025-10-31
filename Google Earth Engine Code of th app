@@ -1,0 +1,329 @@
+// Load mangrove geometry
+var geometry = ee.FeatureCollection("projects/ee-mohammadoney/assets/All_Mangroves_Bangladesh_Asset");
+
+// Create the main panel
+var mainPanel = ui.Panel({
+  style: {width: '400px'}
+});
+
+// Add title
+var title = ui.Label({
+  value: 'Bangladesh Mangrove Monitor',
+  style: {'fontSize': '24px', 'fontWeight': 'bold'}
+});
+mainPanel.add(title);
+
+// Create input panel
+var inputPanel = ui.Panel({
+  layout: ui.Panel.Layout.flow('horizontal'),
+});
+mainPanel.add(inputPanel);
+
+// Month dropdown
+var monthSelector = ui.Select({
+  items: ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'],
+  placeholder: 'Select month'
+});
+inputPanel.add(ui.Label('Month:'));
+inputPanel.add(monthSelector);
+
+// Year text box
+var yearInput = ui.Textbox({
+  placeholder: 'Enter year (e.g., 2023)',
+  style: {width: '100px'}
+});
+inputPanel.add(ui.Label('Year:'));
+inputPanel.add(yearInput);
+
+// Load button
+var loadButton = ui.Button('Load NDVI');
+inputPanel.add(loadButton);
+
+// Message panel for validation
+var messagePanel = ui.Panel();
+mainPanel.add(messagePanel);
+
+// Chart panel (will be added when needed)
+var chartPanel = ui.Panel({style: {width: '400px'}});
+var chartPanelAdded = false;
+
+// Get current year for upper bound
+var currentYear = new Date().getFullYear();
+
+// Function to validate year input
+function validateYear(yearText) {
+  // Check if it's a valid number
+  if (!yearText || yearText.trim() === '') {
+    return {isValid: false, message: 'Please enter a year'};
+  }
+  
+  var year = parseInt(yearText);
+  if (isNaN(year)) {
+    return {isValid: false, message: 'Please enter a valid number for year'};
+  }
+  
+  // Set reasonable bounds (MODIS data starts from 2000)
+  if (year < 2000 || year > currentYear) {
+    return {isValid: false, message: 'Please enter a year between 2000 and ' + currentYear};
+  }
+  
+  return {isValid: true, year: year};
+}
+
+// Function to check if data exists for given month and year
+function checkDataExists(year, month) {
+  var startDate = ee.Date.fromYMD(year, month, 1);
+  var endDate = startDate.advance(1, 'month');
+  
+  var modis = ee.ImageCollection('MODIS/061/MOD13A2')
+    .select('NDVI')
+    .filterBounds(geometry)
+    .filterDate(startDate, endDate);
+  
+  return modis.size();
+}
+
+// Function to get monthly NDVI
+function getMonthlyNDVI(year, month) {
+  var modis = ee.ImageCollection('MODIS/061/MOD13A2')
+    .select('NDVI')
+    .filterBounds(geometry);
+  
+  // Scale NDVI values
+  var modisScaled = modis.map(function(image) {
+    return image.multiply(0.0001)
+      .copyProperties(image, ['system:time_start']);
+  });
+  
+  var startDate = ee.Date.fromYMD(year, month, 1);
+  var endDate = startDate.advance(1, 'month');
+  
+  var monthlyNDVI = modisScaled
+    .filterDate(startDate, endDate)
+    .mean()
+    .clip(geometry);
+  
+  return monthlyNDVI;
+}
+
+// Function to create time series chart with bounds checking
+function createTimeSeriesChart(clickPoint, targetYear, targetMonth) {
+  // Calculate start date (13 months back from target month)
+  var chartStartDate = ee.Date.fromYMD(targetYear, targetMonth, 1).advance(-12, 'month');
+  var chartEndDate = ee.Date.fromYMD(targetYear, targetMonth, 1).advance(1, 'month');
+  
+  // Ensure we don't try to get data before MODIS existed (2000)
+  var earliestDate = ee.Date.fromYMD(2000, 1, 1);
+  var actualStartDate = ee.Algorithms.If(
+    chartStartDate.millis().lt(earliestDate.millis()),
+    earliestDate,
+    chartStartDate
+  );
+  
+  var modis = ee.ImageCollection('MODIS/061/MOD13A2')
+    .select('NDVI')
+    .filterBounds(geometry)
+    .filterDate(actualStartDate, chartEndDate)
+    .map(function(image) {
+      return image.multiply(0.0001)
+        .copyProperties(image, ['system:time_start']);
+    });
+  
+  // Create chart
+  var chart = ui.Chart.image.series({
+    imageCollection: modis,
+    region: clickPoint,
+    reducer: ee.Reducer.mean(),
+    scale: 1000
+  }).setOptions({
+    title: 'NDVI Time Series (' + targetMonth + '/' + targetYear + ')',
+    vAxis: {title: 'NDVI'},
+    hAxis: {
+      title: 'Date',
+      format: 'MMM yyyy',
+      gridlines: {count: 13}
+    },
+    interpolateNulls: true,
+    pointSize: 3,
+    lineWidth: 2,
+    colors: ['#31a354']
+  });
+  
+  return chart;
+}
+
+// Function to clear all
+function resetAll() {
+  Map.clear();
+  messagePanel.clear();
+  if (chartPanelAdded) {
+    ui.root.widgets().remove(chartPanel);
+    chartPanelAdded = false;
+  }
+}
+
+// Main load function
+function loadNDVI() {
+  // Clear previous messages and charts
+  messagePanel.clear();
+  if (chartPanelAdded) {
+    ui.root.widgets().remove(chartPanel);
+    chartPanelAdded = false;
+  }
+  
+  // Get input values
+  var month = monthSelector.getValue();
+  var yearText = yearInput.getValue();
+  
+  // Validate inputs
+  if (!month) {
+    var monthError = ui.Label({
+      value: 'Please select a month',
+      style: {color: 'red', fontSize: '14px'}
+    });
+    messagePanel.add(monthError);
+    return;
+  }
+  
+  var yearValidation = validateYear(yearText);
+  if (!yearValidation.isValid) {
+    var yearError = ui.Label({
+      value: yearValidation.message,
+      style: {color: 'red', fontSize: '14px'}
+    });
+    messagePanel.add(yearError);
+    return;
+  }
+  
+  var year = yearValidation.year;
+  var monthNum = parseInt(month);
+  
+  // Additional check: if selected year is current year, check if month is in future
+  var currentDate = new Date();
+  var currentMonth = currentDate.getMonth() + 1; // JavaScript months are 0-indexed
+  if (year === currentYear && monthNum > currentMonth) {
+    var futureError = ui.Label({
+      value: 'Data for ' + month + '/' + year + ' may not be available yet',
+      style: {color: 'orange', fontSize: '14px'}
+    });
+    messagePanel.add(futureError);
+    // Continue anyway, as MODIS data might have some latency
+  }
+  
+  // Check if data exists (server-side)
+  var dataExists = checkDataExists(year, monthNum);
+  
+  // Evaluate the result
+  dataExists.evaluate(function(size) {
+    if (size === 0) {
+      var noDataMessage = ui.Label({
+        value: 'Sorry, data does not exist for ' + month + '/' + year,
+        style: {color: 'red', fontSize: '14px'}
+      });
+      messagePanel.add(noDataMessage);
+      return;
+    }
+    
+    // Data exists, proceed with loading
+    resetAll();
+    
+    // Get and display NDVI
+    var monthlyNDVI = getMonthlyNDVI(year, monthNum);
+    
+    Map.centerObject(geometry, 9);
+    
+    // Add NDVI layer with contrasting colors (red-yellow-green)
+    Map.addLayer(monthlyNDVI, {
+      min: 0.0,
+      max: 1.0,
+      palette: ['red', 'yellow', 'green']
+    }, 'NDVI ' + month + '/' + year);
+    
+    // Add mangrove boundary but keep it hidden by default
+    var boundaryLayer = Map.addLayer(geometry, {color: 'black', fillColor: '00000000'}, 'Mangrove Boundary');
+    boundaryLayer.setShown(false);
+    
+    // Add success message
+    var successMessage = ui.Label({
+      value: 'Successfully loaded NDVI for ' + month + '/' + year,
+      style: {color: 'green', fontSize: '14px'}
+    });
+    messagePanel.add(successMessage);
+    
+    // Add click message
+    var clickMessage = ui.Label({
+      value: 'Click on the map to see 13-month time series chart',
+      style: {color: 'blue', fontSize: '14px', margin: '10px 0px'}
+    });
+    messagePanel.add(clickMessage);
+    
+    // Set up map click handler for this specific year/month
+    Map.onClick(function(event) {
+      // Clear previous chart
+      chartPanel.clear();
+      
+      // Create coordinates label
+      var coordsLabel = ui.Label({
+        value: 'Coordinates: ' + event.lon.toFixed(4) + ', ' + event.lat.toFixed(4),
+        style: {fontSize: '14px', fontWeight: 'bold'}
+      });
+      chartPanel.add(coordsLabel);
+      
+      // Create and add chart
+      var chart = createTimeSeriesChart(ee.Geometry.Point([event.lon, event.lat]), year, monthNum);
+      chartPanel.add(chart);
+      
+      // Add chart panel to UI if not already added
+      if (!chartPanelAdded) {
+        ui.root.add(chartPanel);
+        chartPanelAdded = true;
+      }
+    });
+  });
+}
+
+// Add click handler to load button
+loadButton.onClick(loadNDVI);
+
+// Add reset button
+var resetPanel = ui.Panel({
+  layout: ui.Panel.Layout.flow('horizontal'),
+});
+mainPanel.add(resetPanel);
+
+var resetButton = ui.Button('Reset All');
+resetButton.onClick(resetAll);
+resetPanel.add(resetButton);
+
+// Add information panel
+var infoPanel = ui.Panel({
+  style: {padding: '8px', margin: '8px'}
+});
+infoPanel.add(ui.Label({
+  value: 'NDVI Color Scale:',
+  style: {fontSize: '16px', fontWeight: 'bold'}
+}));
+infoPanel.add(ui.Label('Red: Low vegetation (0.0-0.33)'));
+infoPanel.add(ui.Label('Yellow: Moderate vegetation (0.33-0.66)'));
+infoPanel.add(ui.Label('Green: High vegetation (0.66-1.0)'));
+mainPanel.add(infoPanel);
+
+// Add author information panel
+var authorPanel = ui.Panel({
+  style: {padding: '8px', margin: '8px', backgroundColor: '#f5f5f5'}
+});
+authorPanel.add(ui.Label({
+  value: 'App by Md Rokib Uddin Oney',
+  style: {fontSize: '14px', fontWeight: 'bold'}
+}));
+authorPanel.add(ui.Label({
+  value: 'Email: mohammadoney@gmail.com',
+  style: {fontSize: '14px'}
+}));
+mainPanel.add(authorPanel);
+
+// Set initial map center
+Map.centerObject(geometry, 8);
+
+// Add to UI
+ui.root.add(mainPanel);
